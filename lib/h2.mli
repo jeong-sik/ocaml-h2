@@ -327,6 +327,13 @@ module Body : sig
   module Reader : sig
     type t
 
+    type completion = Pending | Complete | Aborted
+
+    val completion : t -> completion
+    (** [Complete] means a peer end-of-stream with valid body length was received.
+        Closing or discarding a reader sets [Aborted], including after peer EOF.
+        Buffered bytes may remain after a peer end-of-stream. *)
+
     val schedule_read :
        t
       -> on_eof:(unit -> unit)
@@ -344,6 +351,13 @@ module Body : sig
     val close : t -> unit
     (** [close t] closes [t], indicating that any subsequent input received
         should be discarded. *)
+
+    val discard : t -> unit
+    (** Abort application delivery, discard buffered bytes, return their flow
+        control credits and close the reader. Future discarded DATA also
+        returns connection credits. No application [on_read] callback is run
+        for the discarded bytes; a scheduled [on_eof] observes [Aborted].
+        Repeated calls do not return credits twice. *)
 
     val is_closed : t -> bool
     (** [is_closed t] is [true] if {!close} has been called on [t] and [false]

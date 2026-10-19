@@ -299,7 +299,7 @@ let start_push_stream (t : t) s request =
     let { encoder; body_buffer_size; create_push_stream; _ } = s in
     (* From RFC7540§8.2:
      *   Promised requests [...] MUST NOT include a request body. *)
-    let request_info = create_active_request request Body.Reader.empty in
+    let request_info = create_active_request request (Body.Reader.create_empty ()) in
     let active_stream =
       create_active_stream encoder body_buffer_size create_push_stream
     in
@@ -378,8 +378,13 @@ let report_error (t : t) exn error_code =
       ( ( Open (ActiveMessage { request; request_body; _ })
         | HalfClosed { request; request_body; _ } )
       , stream ) ->
-    Body.Reader.close request_body;
-    _report_error t stream ~request exn error_code
+    Body.Reader.abort request_body;
+    Fun.protect
+      ~finally:(fun () ->
+        (* The original stream error owns the response. An exception from its
+           abort notification must not replace it or kill sibling streams. *)
+        ignore (Body.Reader.execute_read_result request_body))
+      (fun () -> _report_error t stream ~request exn error_code)
   | Closed _ -> ()
 
 let report_exn t exn = report_error t (`Exn exn) Error_code.InternalError
@@ -421,7 +426,7 @@ let flush_request_body (t : t) =
       ( ( Open (ActiveMessage { request_body; _ })
         | HalfClosed { request_body; _ } )
       , _ ) ->
-    if Body.Reader.has_pending_output request_body
+    if Body.Reader.has_pending_output request_body || Body.Reader.is_closed request_body
     then (
       try Body.Reader.execute_read request_body with exn -> report_exn t exn)
   | _ -> ()

@@ -271,6 +271,17 @@ let handle_push_promise_headers t respd headers =
          *   identifier back to the sender of the PUSH_PROMISE. *)
         Stream.reset_stream respd Error_code.Cancel))
 
+let response_body_length (request : Request.t) (response : Response.t) =
+  match Message.body_length response.headers with
+  | `Error _ as error -> error
+  | (`Fixed _ | `Unknown) as length ->
+    if request.meth = `HEAD
+       || Status.is_informational response.status
+       || response.status = `No_content
+       || response.status = `Not_modified
+    then `Fixed 0L
+    else length
+
 let handle_response_headers t stream ~end_stream active_request headers =
   let (Scheduler.Stream { descriptor = respd; _ }) = stream in
   (* From RFC7540§8.1.2.6:
@@ -281,16 +292,12 @@ let handle_response_headers t stream ~end_stream active_request headers =
   match Headers.get_multi_pseudo headers "status" with
   | [ status ] ->
     let response = Response.create ~headers (Status.of_string status) in
-    (* Note: we don't need to check for `end_stream` flag + a non-zero body
-     * length, as the spec allows for non-zero content-length headers and no
-     * DATA frames.
-     *
-     * From RFC7540§8.1.2.6:
-     *   A response that is defined to have no payload, as described in
-     *   [RFC7230], Section 3.3.2, can have a non-zero content-length header
-     *   field, even though no content is included in DATA frames. *)
-    (match Message.body_length headers with
+    (* HEAD and bodyless statuses may carry representation length metadata;
+       other fixed-length responses must have received all declared bytes. *)
+    (match response_body_length active_request.Respd.request response with
     | `Error _ ->
+      set_error_and_handle t respd (`Invalid_response_body_length response) ProtocolError
+    | `Fixed len when end_stream && not (Int64.equal len 0L) ->
       set_error_and_handle
         t
         respd
@@ -299,14 +306,17 @@ let handle_response_headers t stream ~end_stream active_request headers =
     | `Fixed _ | `Unknown ->
       let response_body =
         if end_stream
-        then Body.Reader.empty
+        then (Body.Reader.create_empty ())
         else
           Body.Reader.create
             (Bigstringaf.create t.config.response_body_buffer_size)
             ~done_reading:(fun len ->
               let len = Int32.of_int len in
-              send_window_update t t.streams len;
-              send_window_update t stream len)
+              if not (Writer.is_closed t.writer) then (
+                send_window_update t t.streams len;
+                match respd.state with
+                | Active _ -> send_window_update t stream len
+                | Idle | Reserved _ | Closed _ -> ()))
       in
       let new_response_state =
         Respd.create_active_response response response_body
@@ -322,7 +332,8 @@ let handle_response_headers t stream ~end_stream active_request headers =
       then (
         (* Deliver EOF to the response body, as the handler might be waiting
          * on it to act. *)
-        Body.Reader.close response_body;
+        Body.Reader.finish response_body;
+        Respd.flush_response_body respd;
         (* From RFC7540§5.1:
          *   [...] an endpoint receiving an END_STREAM flag causes the stream
          *   state to become "half-closed (remote)". *)
@@ -414,9 +425,20 @@ let handle_headers_block
         handle_headers t ~end_stream stream headers
       else if Headers.trailers_valid headers
       then (
-        Respd.deliver_trailer_headers respd headers;
-        let response_body = Respd.response_body_exn respd in
-        Body.Reader.close response_body)
+        match respd.state with
+        | Active ((Open (ActiveMessage info) | HalfClosed (ActiveMessage info)), active_request) ->
+          let complete = match response_body_length active_request.request info.response with
+            | `Fixed len -> Int64.equal len info.response_body_bytes
+            | `Unknown -> true
+            | `Error `Bad_request -> false
+          in
+          if complete then (
+            Respd.deliver_trailer_headers respd headers;
+            Body.Reader.finish info.response_body;
+            Respd.flush_response_body respd;
+            if not (Respd.requires_output respd) then Stream.finish_stream respd Finished)
+          else set_error_and_handle t respd (`Invalid_response_body_length info.response) ProtocolError
+        | Idle | Reserved _ | Active ((Open (WaitingForPeer | PartialHeaders _ | FullHeaders) | HalfClosed (WaitingForPeer | PartialHeaders _ | FullHeaders)), _) | Closed _ -> ())
       else
         (* From RFC7540§8.1.2.1:
          *   Pseudo-header fields MUST NOT appear in trailers. Endpoints MUST
@@ -547,8 +569,7 @@ let process_headers_frame t { Frame.frame_header; _ } headers_block =
         stream
         active_response
         frame_header
-        headers_block;
-      Stream.finish_stream descriptor Finished
+        headers_block
     | Closed { reason = ResetByThem _; _ } ->
       (* From RFC7540§5.1:
        *   closed: [...] An endpoint that receives any frame other than
@@ -571,32 +592,26 @@ let process_data_frame t { Frame.frame_header; _ } bstr =
   let open Scheduler in
   let { Frame.flags; stream_id; payload_length; _ } = frame_header in
   let payload_len32 = Int32.of_int payload_length in
-  match Scheduler.get_node t.streams stream_id with
+  let stream_node = Scheduler.get_node t.streams stream_id in
+  let allowed_to_receive = match stream_node with
+    | Some stream -> Scheduler.allowed_to_receive t.streams stream payload_len32
+    | None -> true
+  in
+  (* Closed and retired streams still debit the connection before returning
+     discarded DATA credits. *)
+  Scheduler.deduct_inflow t.streams payload_len32;
+  match stream_node with
   | Some (Stream { descriptor; _ } as stream) ->
     (match descriptor.state with
     | Active
         ( ( Open (ActiveMessage response_info)
           | HalfClosed (ActiveMessage response_info) )
-        , _ ) ->
+        , active_request ) ->
       let { Respd.response; response_body; response_body_bytes; _ } =
         response_info
       in
       response_info.response_body_bytes <-
         Int64.(add response_body_bytes (of_int (Bigstringaf.length bstr)));
-      (* First, calculate whether we're allowed to receive this frame based
-       * on the _current_ inflow. *)
-      let allowed_to_receive =
-        Scheduler.(allowed_to_receive t.streams stream payload_len32)
-      in
-      (* Then, deduct inflow from the connection flow-control window, as
-       * mandated by the protocol.
-       *
-       * From RFC7540§6.9:
-       *   A receiver that receives a flow-controlled frame MUST always account
-       *   for its contribution against the connection flow-control window,
-       *   unless the receiver treats this as a connection error (Section 5.4.1).
-       *   This is necessary even if the frame is in error. *)
-      Scheduler.deduct_inflow t.streams payload_len32;
       if not allowed_to_receive
       then (
         (* From RFC7540§6.9:
@@ -607,10 +622,11 @@ let process_data_frame t { Frame.frame_header; _ } bstr =
         report_stream_error t stream_id Error_code.FlowControlError)
       else (
         Scheduler.deduct_inflow stream payload_len32;
-        match Message.body_length response.headers with
+        match response_body_length active_request.request response with
         | `Fixed len
         (* Getting more than the server declared *)
-          when Int64.compare response_info.response_body_bytes len > 0 ->
+          when Int64.compare response_info.response_body_bytes len > 0
+               || (Flags.test_end_stream flags && not (Int64.equal response_info.response_body_bytes len)) ->
           (* Give back connection-level flow-controlled bytes (we use payload
            * length to include any padding bytes that the frame might have
            * included - which were ignored at parse time). *)
@@ -638,8 +654,16 @@ let process_data_frame t { Frame.frame_header; _ } bstr =
           let faraday = Body.Reader.unsafe_faraday response_body in
           if not (Faraday.is_closed faraday)
           then (
+            let padding = payload_length - Bigstringaf.length bstr in
+            if padding > 0 then (
+              let padding = Int32.of_int padding in
+              send_window_update t t.streams padding;
+              send_window_update t stream padding);
             Faraday.schedule_bigstring faraday bstr;
-            if end_stream then Body.Reader.close response_body);
+            if end_stream then Body.Reader.finish response_body)
+          else (
+            send_window_update t t.streams payload_len32;
+            send_window_update t stream payload_len32);
           Respd.flush_response_body descriptor;
           if end_stream && not (Respd.requires_output descriptor)
           then
@@ -692,8 +716,9 @@ let process_data_frame t { Frame.frame_header; _ } bstr =
        *   a stream in this state MUST be treated as a connection error
        *   (Section 5.4.1) of type PROTOCOL_ERROR. *)
       report_connection_error t Error_code.ProtocolError
+    else send_window_update t t.streams payload_len32
 
-let on_close_stream t id ~active closed =
+let on_close_stream t id ~active ~(state : Respd.state) closed =
   if active
   then
     (* From RFC7540§5.1.2:
@@ -701,7 +726,20 @@ let on_close_stream t id ~active closed =
      *   states count toward the maximum number of streams that an endpoint is
      *   permitted to open. *)
     t.current_server_streams <- t.current_server_streams - 1;
-  Scheduler.mark_for_removal t.streams id closed
+  Scheduler.mark_for_removal t.streams id closed;
+  (match closed.Stream.reason, state with
+   | Finished, _ -> ()
+   | ResetByThem NoError, Active ((Open (ActiveMessage { Respd.response_body; _ }) | HalfClosed (ActiveMessage { Respd.response_body; _ })), _)
+     when Body.Reader.completion response_body = Body.Reader.Complete ->
+     (* RFC7540§8.1: cancellation of the upload after a complete response
+        does not invalidate that response or discard its unread bytes. *)
+     ()
+   | (ResetByUs _ | ResetByThem _), Active ((Open (ActiveMessage { Respd.response_body; _ }) | HalfClosed (ActiveMessage { Respd.response_body; _ })), _) ->
+        (try Body.Reader.discard response_body with exn ->
+          match Scheduler.find t.streams id with
+          | Some respd -> Respd.report_error respd (`Exn exn) InternalError
+          | None -> ())
+   | (ResetByUs _ | ResetByThem _), (Idle | Reserved _ | Active ((Open (WaitingForPeer | PartialHeaders _ | FullHeaders) | HalfClosed (WaitingForPeer | PartialHeaders _ | FullHeaders)), _) | Closed _) -> ())
 
 let process_priority_frame t { Frame.frame_header; _ } priority =
   let { Frame.stream_id; _ } = frame_header in

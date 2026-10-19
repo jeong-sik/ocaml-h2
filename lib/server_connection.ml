@@ -165,7 +165,7 @@ let report_exn t exn =
     let reason = Printexc.to_string exn in
     report_connection_error t ~reason Error_code.InternalError
 
-let on_close_stream t id ~active closed =
+let on_close_stream t id ~active ~state closed =
   if active
   then
     (* From RFC7540§5.1.2:
@@ -173,7 +173,16 @@ let on_close_stream t id ~active closed =
      *   states count toward the maximum number of streams that an endpoint is
      *   permitted to open. *)
     t.current_client_streams <- t.current_client_streams - 1;
-  Scheduler.mark_for_removal t.streams id closed
+  Scheduler.mark_for_removal t.streams id closed;
+  (match state with
+   | Stream.Active ((Open (ActiveMessage { Reqd.request_body; _ }) | HalfClosed { Reqd.request_body; _ }), _) ->
+     (match closed.Stream.reason, Body.Reader.completion request_body with
+      | Finished, Body.Reader.Complete when not (Body.Reader.has_pending_output request_body) -> ()
+      | (Finished | ResetByUs _ | ResetByThem _), (Body.Reader.Pending | Complete | Aborted) ->
+        (match Scheduler.find t.streams id with
+         | Some reqd -> ignore (Reqd.try_with reqd (fun () -> Body.Reader.discard request_body))
+         | None -> Body.Reader.discard request_body))
+   | Idle | Reserved _ | Active (Open (WaitingForPeer | PartialHeaders _ | FullHeaders), _) | Closed _ -> ())
 
 let send_window_update :
     type a. t -> a Scheduler.PriorityTreeNode.node -> int32 -> unit
@@ -246,8 +255,12 @@ let create_push_stream t parent_stream_id =
     in
     Ok reqd
 
-let handle_headers t ~end_stream stream active_stream headers =
+let handle_headers ?h2c_body t ~end_stream stream active_stream headers =
   let (Scheduler.Stream { descriptor = reqd; _ }) = stream in
+  let initial_body_bytes = match h2c_body with
+    | None -> 0
+    | Some iovecs -> Httpun_types.IOVec.lengthv iovecs
+  in
   (* From RFC7540§5.1.2:
    *   Endpoints MUST NOT exceed the limit set by their peer. An endpoint that
    *   receives a HEADERS frame that causes its advertised concurrent stream
@@ -285,16 +298,12 @@ let handle_headers t ~end_stream stream active_stream headers =
        *   closing or resetting the stream. *)
       set_error_and_handle t reqd `Bad_request ProtocolError
     | `Valid (meth, path, scheme) ->
-      (* Note: we don't need to check for `end_stream` flag + a non-zero body
-       * length, as the spec allows for non-zero content-length headers and no
-       * DATA frames.
-       *
-       * From RFC7540§8.1.2.6:
-       *   A response that is defined to have no payload, as described in
-       *   [RFC7230], Section 3.3.2, can have a non-zero content-length header
-       *   field, even though no content is included in DATA frames. *)
+      (* Requests have no HEAD/304 response exception for a mismatched length.
+         An h2c upgrade already received its complete body over HTTP/1.1. *)
       (match Message.body_length headers with
       | `Error e -> set_error_and_handle t reqd e ProtocolError
+      | `Fixed len when end_stream && not (Int64.equal len (Int64.of_int initial_body_bytes)) ->
+        set_error_and_handle t reqd `Bad_request ProtocolError
       | `Fixed _ | `Unknown ->
         let request =
           Request.create
@@ -304,9 +313,18 @@ let handle_headers t ~end_stream stream active_stream headers =
             path
         in
         let request_body =
-          if end_stream
-          then Body.Reader.empty
-          else
+          match h2c_body with
+          | Some iovecs ->
+            (* HTTP/1.1 bytes never debited the H2 connection window. *)
+            let body = Body.Reader.create
+              (Bigstringaf.create t.config.request_body_buffer_size)
+              ~done_reading:ignore in
+            let faraday = Body.Reader.unsafe_faraday body in
+            List.iter (fun { Httpun_types.IOVec.buffer; off; len } ->
+              Faraday.schedule_bigstring faraday ~off ~len buffer) iovecs;
+            body
+          | None when end_stream -> Body.Reader.create_empty ()
+          | None ->
             Body.Reader.create
               (Bigstringaf.create t.config.request_body_buffer_size)
               ~done_reading:(fun len ->
@@ -316,13 +334,14 @@ let handle_headers t ~end_stream stream active_stream headers =
                  *   consumes data and frees up space in flow-control windows.
                  *   Separate WINDOW_UPDATE frames are sent for the stream- and
                  *   connection-level flow-control windows. *)
-                match reqd.state with
-                | Active _ ->
+                if not (Writer.is_closed t.writer) then (
                   send_window_update t t.streams len;
-                  send_window_update t stream len
-                | Idle | Reserved _ | Closed _ -> ())
+                  match reqd.state with
+                  | Active _ -> send_window_update t stream len
+                  | Idle | Reserved _ | Closed _ -> ()))
         in
         let request_info = Reqd.create_active_request request request_body in
+        request_info.request_body_bytes <- Int64.of_int initial_body_bytes;
         if end_stream
         then (
           (* From RFC7540§5.1:
@@ -331,7 +350,7 @@ let handle_headers t ~end_stream stream active_stream headers =
           reqd.state <- Active (HalfClosed request_info, active_stream);
           (* Deliver EOF to the request body, as the handler might be waiting
            * on it to produce a response. *)
-          Body.Reader.close request_body)
+          Body.Reader.finish request_body)
         else
           reqd.state <- Active (Open (ActiveMessage request_info), active_stream);
         t.request_handler reqd;
@@ -386,9 +405,20 @@ let handle_headers_block
           headers)
       else if Headers.trailers_valid headers
       then (
-        Reqd.deliver_trailer_headers reqd headers;
-        let request_body = Reqd.request_body reqd in
-        Body.Reader.close request_body)
+        match reqd.state with
+        | Active ((Open (ActiveMessage info) | HalfClosed info), active_stream) ->
+          let complete = match Message.body_length info.request.headers with
+            | `Fixed len -> Int64.equal len info.request_body_bytes
+            | `Unknown -> true
+            | `Error `Bad_request -> false
+          in
+          if complete then (
+            reqd.state <- Active (HalfClosed info, active_stream);
+            Reqd.deliver_trailer_headers reqd headers;
+            Body.Reader.finish info.request_body;
+            Reqd.flush_request_body reqd)
+          else set_error_and_handle t reqd `Bad_request ProtocolError
+        | Idle | Reserved _ | Active (Open (WaitingForPeer | PartialHeaders _ | FullHeaders), _) | Closed _ -> ())
       else
         (* From RFC7540§8.1.2.1:
          *   Pseudo-header fields MUST NOT appear in trailers. Endpoints MUST
@@ -574,8 +604,7 @@ let process_headers_frame t { Frame.frame_header; _ } ~priority headers_block =
           stream
           active_stream
           frame_header
-          headers_block;
-        Stream.finish_stream reqd Finished
+          headers_block
       | Active (HalfClosed _, _)
       (* From RFC7540§5.1:
        *   half-closed (remote): [...] If an endpoint receives additional
@@ -618,8 +647,13 @@ let process_data_frame t { Frame.frame_header; _ } bstr =
      *   unless the receiver treats this as a connection error (Section 5.4.1).
      *   This is necessary even if the frame is in error. *)
     let payload_len32 = Int32.of_int payload_length in
+    let stream_node = Scheduler.get_node t.streams stream_id in
+    let allowed_to_receive = match stream_node with
+      | Some stream -> Scheduler.allowed_to_receive t.streams stream payload_len32
+      | None -> true
+    in
     Scheduler.deduct_inflow t.streams payload_len32;
-    match Scheduler.get_node t.streams stream_id with
+    match stream_node with
     | Some (Stream { descriptor; _ } as stream) ->
       (match descriptor.state with
       | Active (Open (ActiveMessage request_info), active_stream) ->
@@ -630,7 +664,7 @@ let process_data_frame t { Frame.frame_header; _ } bstr =
               request_info.request_body_bytes
               (of_int (Bigstringaf.length bstr)));
         let request = request_info.request in
-        if not Scheduler.(allowed_to_receive t.streams stream payload_len32)
+        if not allowed_to_receive
         then (
           (* From RFC7540§6.9:
            *  A receiver MAY respond with a stream error (Section 5.4.2) or
@@ -643,7 +677,8 @@ let process_data_frame t { Frame.frame_header; _ } bstr =
           match Message.body_length request.headers with
           | `Fixed len
           (* Getting more than the client declared *)
-            when Int64.compare request_info.request_body_bytes len > 0 ->
+            when Int64.compare request_info.request_body_bytes len > 0
+                 || (Flags.test_end_stream flags && not (Int64.equal request_info.request_body_bytes len)) ->
             (* Give back connection-level flow-controlled bytes (we use payload
              * length to include any padding bytes that the frame might have
              * included - which were ignored at parse time). *)
@@ -682,8 +717,17 @@ let process_data_frame t { Frame.frame_header; _ } bstr =
             let faraday = Body.Reader.unsafe_faraday request_body in
             if not (Faraday.is_closed faraday)
             then (
+              let padding = payload_length - Bigstringaf.length bstr in
+              if padding > 0 then (
+                let padding = Int32.of_int padding in
+                send_window_update t t.streams padding;
+                send_window_update t stream padding);
               Faraday.schedule_bigstring faraday bstr;
-              if end_stream then Body.Reader.close request_body);
+              if end_stream then Body.Reader.finish request_body)
+            else (
+              (* Discarded bytes consume no application buffer. *)
+              send_window_update t t.streams payload_len32;
+              send_window_update t stream payload_len32);
             Reqd.flush_request_body descriptor)
       | Idle ->
         (* From RFC7540§5.1:
@@ -725,6 +769,9 @@ let process_data_frame t { Frame.frame_header; _ } bstr =
          *   a stream in this state MUST be treated as a connection error
          *   (Section 5.4.1) of type PROTOCOL_ERROR. *)
         report_connection_error t Error_code.ProtocolError
+      else
+        (* DATA can remain in flight after a stream leaves the scheduler. *)
+        send_window_update t t.streams payload_len32
 
 let process_priority_frame t { Frame.frame_header; _ } priority =
   let { Frame.stream_id; _ } = frame_header in
@@ -1265,31 +1312,7 @@ let handle_h2c_request t headers request_body_iovecs =
         (create_push_stream t)
     in
     t.max_client_stream_id <- reqd.Stream.id;
-    let lengthv = Httpun_types.IOVec.lengthv request_body_iovecs in
-    let end_stream = lengthv = 0 in
-    handle_headers t ~end_stream stream active_stream headers;
-    let request = Reqd.request reqd in
-    let request_body = Reqd.request_body reqd in
-    let request_info = Reqd.create_active_request request request_body in
-    request_info.request_body_bytes <-
-      Int64.(add request_info.request_body_bytes (of_int lengthv));
-    (* From RFC7540§3.2:
-     *   Stream 1 is implicitly "half-closed" from the client toward the server
-     *   (see Section 5.1), since the request is completed as an HTTP/1.1
-     *   request. After commencing the HTTP/2 connection, stream 1 is used for
-     *   the response. *)
-    reqd.state <- Active (HalfClosed request_info, active_stream);
-    if not end_stream
-    then
-      let faraday = Body.Reader.unsafe_faraday request_body in
-      if not (Faraday.is_closed faraday)
-      then (
-        List.iter
-          (fun { Httpun_types.IOVec.buffer; off; len } ->
-             Faraday.schedule_bigstring faraday ~off ~len buffer)
-          request_body_iovecs;
-        (* Close the request body, we're not expecting more input. *)
-        Body.Reader.close request_body)
+    handle_headers ~h2c_body:request_body_iovecs t ~end_stream:true stream active_stream headers
   | None -> ()
 
 (* This function is meant to be called inside an HTTP/1.1 upgrade handler.

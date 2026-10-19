@@ -33,8 +33,11 @@
  *---------------------------------------------------------------------------*)
 
 module Reader = struct
+  type completion = Pending | Complete | Aborted
+
   type t =
     { faraday : Faraday.t
+    ; mutable completion : completion
     ; mutable read_scheduled : bool
     ; mutable on_eof : unit -> unit
     ; mutable on_read : Bigstringaf.t -> off:int -> len:int -> unit
@@ -47,6 +50,7 @@ module Reader = struct
 
   let create buffer ~done_reading =
     { faraday = Faraday.of_bigstring buffer
+    ; completion = Pending
     ; read_scheduled = false
     ; on_eof = default_on_eof
     ; on_read = default_on_read
@@ -55,10 +59,11 @@ module Reader = struct
 
   let create_empty () =
     let t = create Bigstringaf.empty ~done_reading:default_done_reading in
+    t.completion <- Complete;
     Faraday.close t.faraday;
     t
 
-  let empty = create_empty ()
+  let completion t = t.completion
   let is_closed t = Faraday.is_closed t.faraday
   let unsafe_faraday t = t.faraday
 
@@ -77,14 +82,18 @@ module Reader = struct
       t.on_read <- default_on_read;
       let { Httpun_types.IOVec.buffer; off; len } = iovec in
       Faraday.shift t.faraday len;
-      on_read buffer ~off ~len;
       (* Application is done reading, we can give flow control tokens back to
-         the peer. *)
-      t.done_reading len;
+         the peer, including if its callback raises after taking the chunk. *)
+      Fun.protect
+        ~finally:(fun () -> t.done_reading len)
+        (fun () -> on_read buffer ~off ~len);
       execute_read t
 
   and execute_read t =
     if t.read_scheduled then do_execute_read t t.on_eof t.on_read
+
+  let execute_read_result t =
+    match execute_read t with () -> Ok () | exception exn -> Error exn
 
   let schedule_read t ~on_eof ~on_read =
     if t.read_scheduled
@@ -96,8 +105,31 @@ module Reader = struct
       t.on_read <- on_read);
     do_execute_read t on_eof on_read
 
+  let finish t =
+    (match t.completion with Pending -> t.completion <- Complete | Complete | Aborted -> ());
+    Faraday.close t.faraday
+
   let close t =
+    t.completion <- Aborted;
     Faraday.close t.faraday;
+    execute_read t
+
+  let abort t =
+    (* The current on_read chunk was shifted before its callback, and its
+       done_reading belongs to the outer call. Return only still-buffered bytes. *)
+    t.completion <- Aborted;
+    let rec drain () =
+      match Faraday.operation t.faraday with
+      | `Writev chunks ->
+        let len = List.fold_left (fun n (v : _ Httpun_types.IOVec.t) -> n + v.len) 0 chunks in
+        if len > 0 then (Faraday.shift t.faraday len; t.done_reading len; drain ())
+      | `Yield | `Close -> ()
+    in
+    Faraday.close t.faraday;
+    drain ()
+
+  let discard t =
+    abort t;
     execute_read t
 
   let has_pending_output t = Faraday.has_pending_output t.faraday
