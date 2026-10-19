@@ -875,6 +875,115 @@ module Server_connection_tests = struct
     read_request t request;
     write_response t (Response.create `OK)
 
+  let read_numbered_request encoder t id =
+    let writer = Serialize.Writer.create 0x400 in
+    let frame_info = Writer.make_frame_info
+      ~flags:Flags.(default_flags |> set_end_stream) id in
+    Serialize.Writer.write_request_headers writer encoder
+      ~priority:Priority.default_priority frame_info
+      (Request.create ~scheme:"https" `GET (Int32.to_string id));
+    read_string t (Faraday.serialize_to_string (Serialize.Writer.faraday writer))
+
+  let read_reset t id =
+    let writer = Serialize.Writer.create 0x400 in
+    Serialize.Writer.write_rst_stream writer (Writer.make_frame_info id) Error_code.Cancel;
+    read_string t (Faraday.serialize_to_string (Serialize.Writer.faraday writer))
+
+  let drain_frames t =
+    let rec loop acc = match next_write_operation t with
+      | `Write iovecs ->
+        let frames = parse_frames (Write_operation.iovecs_to_string iovecs) in
+        report_write_result t (`Ok (IOVec.lengthv iovecs));
+        loop (List.rev_append frames acc)
+      | `Yield | `Close _ -> List.rev acc in
+    loop []
+
+  let test_refused_streams_do_not_create_capacity acknowledged () =
+    let admitted = ref [] in
+    let t = create_and_handle_preface
+      ~config:{ Config.default with max_concurrent_streams=2l }
+      (fun reqd ->
+        admitted := (Reqd.request reqd).target :: !admitted;
+        ignore (Reqd.respond_with_streaming ~flush_headers_immediately:true reqd
+          (Response.create `OK))) in
+    if acknowledged then read_string t (string_of_hex "000000040100000000");
+    let encoder = Hpack.Encoder.create 4096 in
+    List.iter (read_numbered_request encoder t) [1l;3l;5l;7l;9l;11l];
+    Alcotest.(check (list string)) "only two requests reach the handler"
+      ["3";"1"] !admitted;
+    Alcotest.(check int) "refusals preserve the two occupied slots"
+      2 t.current_client_streams;
+    let refused = drain_frames t |> List.filter_map (fun frame ->
+      match frame.Frame.frame_payload with
+      | RSTStream code -> Some (frame.frame_header.stream_id, code)
+      | _ -> None) in
+    Alcotest.(check (list int32)) "every excess stream is reset"
+      [5l;7l;9l;11l] (List.map fst refused);
+    List.iter (fun (_,code) -> Alcotest.(check int32) "correct refusal code"
+      (Error_code.serialize (if acknowledged then ProtocolError else RefusedStream))
+      (Error_code.serialize code)) refused;
+    read_reset t 1l;
+    Alcotest.(check int) "reset returns exactly one slot" 1 t.current_client_streams;
+    read_numbered_request encoder t 13l;
+    read_numbered_request encoder t 15l;
+    Alcotest.(check (list string)) "only one replacement request is admitted"
+      ["13";"3";"1"] !admitted;
+    Alcotest.(check int) "replacement fills the returned slot" 2 t.current_client_streams;
+    read_reset t 3l; read_reset t 13l;
+    Alcotest.(check int) "all admitted resets release all slots" 0 t.current_client_streams
+
+  let test_partial_headers_are_counted () =
+    let admitted = ref false in
+    let t = create_and_handle_preface (fun _ -> admitted := true) in
+    let headers, continuation = header_and_continuation_frames in
+    let feed frame =
+      let data = Test_common.serialize_frame frame in
+      ignore (read t data ~off:0 ~len:(Bigstringaf.length data)) in
+    feed headers;
+    Alcotest.(check bool) "partial block has not reached the handler" false !admitted;
+    Alcotest.(check int) "initial HEADERS acquires one slot" 1 t.current_client_streams;
+    feed continuation;
+    Alcotest.(check bool) "complete block reaches the handler" true !admitted;
+    Alcotest.(check int) "CONTINUATION does not acquire another slot" 1 t.current_client_streams;
+    read_reset t 1l;
+    Alcotest.(check int) "reset releases the acquired slot" 0 t.current_client_streams
+
+  let test_push_completion_does_not_release_a_client_slot () =
+    let primary = ref None in
+    let t = create_and_handle_preface
+      ~config:{Config.default with max_concurrent_streams=1l}
+      (fun reqd -> primary := Some reqd;
+        ignore (Reqd.respond_with_streaming ~flush_headers_immediately:true reqd
+          (Response.create `OK))) in
+    let encoder = Hpack.Encoder.create 4096 in
+    read_numbered_request encoder t 1l;
+    let pushed = match Reqd.push (Option.get !primary)
+      (Request.create ~scheme:"https" `GET "/asset") with
+      | Ok reqd -> reqd | Error _ -> Alcotest.fail "push refused" in
+    Reqd.respond_with_string pushed (Response.create `OK) "asset";
+    ignore (drain_frames t);
+    Alcotest.(check int) "server push does not free the client's occupied slot"
+      1 t.current_client_streams;
+    read_numbered_request encoder t 3l;
+    Alcotest.(check string) "second request did not replace the primary"
+      "1" (Reqd.request (Option.get !primary)).target;
+    Alcotest.(check int) "peer concurrency remains one" 1 t.current_client_streams
+
+  let test_h2c_zero_capacity_is_balanced () =
+    let admitted = ref false in
+    let result = create_h2c ~config:{Config.default with max_concurrent_streams=0l}
+      ~meth:`GET ~target:"/"
+      ~headers:(Httpun_types.Headers.of_list
+        ["Connection","Upgrade, HTTP2-Settings";"Upgrade","h2c";
+         "HTTP2-Settings","";"Host","localhost"])
+      (fun _ -> admitted := true) in
+    match result with
+    | Error message -> Alcotest.fail message
+    | Ok t ->
+      Alcotest.(check bool) "upgrade request is refused before application" false !admitted;
+      Alcotest.(check int) "refused upgraded stream does not subtract a free slot"
+        0 t.current_client_streams
+
   let streaming_handler ?(flush = false) response writes reqd =
     let request_body = Reqd.request_body reqd in
     Body.Reader.close request_body;
@@ -1392,6 +1501,14 @@ module Server_connection_tests = struct
     ; ( "Client sends 0 max concurrent streams"
       , `Quick
       , test_client_max_concurrent_streams )
+    ; ( "refused streams preserve capacity before settings ACK", `Quick,
+        test_refused_streams_do_not_create_capacity false )
+    ; ( "refused streams preserve capacity after settings ACK", `Quick,
+        test_refused_streams_do_not_create_capacity true )
+    ; "partial headers occupy one slot", `Quick, test_partial_headers_are_counted
+    ; ( "push completion preserves client capacity", `Quick,
+        test_push_completion_does_not_release_a_client_slot )
+    ; "zero-capacity h2c is balanced", `Quick, test_h2c_zero_capacity_is_balanced
     ; ( "empty fixed streaming response"
       , `Quick
       , test_empty_fixed_streaming_response )

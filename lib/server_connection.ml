@@ -166,7 +166,7 @@ let report_exn t exn =
     report_connection_error t ~reason Error_code.InternalError
 
 let on_close_stream t id ~active ~state closed =
-  if active
+  if active && Stream_identifier.is_request id
   then
     (* From RFC7540§5.1.2:
      *   Streams that are in the "open" state or in either of the "half-closed"
@@ -268,7 +268,7 @@ let handle_headers ?h2c_body t ~end_stream stream active_stream headers =
    *   of type PROTOCOL_ERROR or REFUSED_STREAM. *)
   if Int32.(
        compare
-         (of_int (t.current_client_streams + 1))
+         (of_int t.current_client_streams)
          t.config.max_concurrent_streams)
      > 0
   then
@@ -286,11 +286,6 @@ let handle_headers ?h2c_body t ~end_stream stream active_stream headers =
     else report_stream_error t reqd.Stream.id Error_code.ProtocolError
   else (
     reqd.state <- Active (Open FullHeaders, active_stream);
-    (* From RFC7540§5.1.2:
-     *   Streams that are in the "open" state or in either of the "half-closed"
-     *   states count toward the maximum number of streams that an endpoint is
-     *   permitted to open. *)
-    t.current_client_streams <- t.current_client_streams + 1;
     match Headers.method_path_and_scheme_or_malformed headers with
     | `Malformed ->
       (* From RFC7540§8.1.2.6:
@@ -516,6 +511,12 @@ let process_first_headers_block t frame_header stream headers_block =
   in
   reqd.Stream.state <-
     Active (Open (PartialHeaders partial_headers), active_stream);
+  (* Initial HEADERS opens the stream, including while HPACK decoding is
+     incomplete. Count at that transition: a rejected header block is already
+     Active when reset, so counting only after admission allowed each refused
+     stream to subtract a slot it had never acquired. Decode the complete block
+     before refusing it, preserving the connection's shared HPACK state. *)
+  t.current_client_streams <- t.current_client_streams + 1;
   if not end_headers then t.receiving_headers_for_stream <- Some stream_id;
   handle_headers_block
     t
@@ -1312,6 +1313,10 @@ let handle_h2c_request t headers request_body_iovecs =
         (create_push_stream t)
     in
     t.max_client_stream_id <- reqd.Stream.id;
+    (* The upgraded HTTP/1 request enters the same counted state without
+       passing through [process_first_headers_block]. *)
+    reqd.Stream.state <- Active (Open FullHeaders, active_stream);
+    t.current_client_streams <- t.current_client_streams + 1;
     handle_headers ~h2c_body:request_body_iovecs t ~end_stream:true stream active_stream headers
   | None -> ()
 
