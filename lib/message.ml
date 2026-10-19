@@ -37,9 +37,16 @@
  * as 'messages'. *)
 
 let content_length_of_string s =
-  match Int64.of_string s with
-  | len when Int64.compare len 0L >= 0 -> `Fixed len
-  | _ | (exception _) -> `Error `Bad_request
+  (* HTTP field syntax is decimal DIGIT+, not OCaml integer syntax. *)
+  let rec decimal i =
+    i = String.length s
+    || (match s.[i] with '0' .. '9' -> decimal (i + 1) | _ -> false)
+  in
+  if String.length s = 0 || not (decimal 0)
+  then `Error `Bad_request
+  else match Int64.of_string_opt s with
+    | Some len when Int64.compare len 0L >= 0 -> `Fixed len
+    | None | Some _ -> `Error `Bad_request
 
 let body_length headers =
   match Headers.get_multi headers "content-length" with
@@ -50,4 +57,4 @@ let body_length headers =
      * exactly equal. *)
     if List.for_all (String.equal hd) tl
     then content_length_of_string hd
-    else `Unknown
+    else `Error `Bad_request

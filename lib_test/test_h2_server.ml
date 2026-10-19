@@ -961,10 +961,15 @@ module Server_connection_tests = struct
         `GET
         "/"
     in
-    let t = create_and_handle_preface ~error_handler default_request_handler in
+    let rejected = ref false in
+    let error_handler ?request:_ error respond =
+      rejected := error = `Bad_request;
+      Body.Writer.close (respond Headers.empty)
+    in
+    let t = create_and_handle_preface ~error_handler
+      (fun _ -> Alcotest.fail "Incomplete request reached application") in
     read_request t request;
-    write_response t ?body:None (Response.create `OK);
-    writer_yields t
+    Alcotest.(check bool) "Incomplete request rejected" true !rejected
 
   let test_unexpected_eof () =
     let t = create_and_handle_preface ~error_handler default_request_handler in
@@ -1205,6 +1210,13 @@ module Server_connection_tests = struct
                 Frame.FrameType.serialize frame_type)
              frames);
         report_write_result t (`Ok (IOVec.lengthv iovecs));
+        (match next_write_operation t with
+         | `Write credits ->
+           (match parse_frames (Write_operation.iovecs_to_string credits) with
+            | [{ Frame.frame_header = { stream_id = 0l; _ }; frame_payload = WindowUpdate 3l }] -> ()
+            | _ -> Alcotest.fail "Finished request must return unread connection credits");
+           report_write_result t (`Ok (IOVec.lengthv credits))
+         | _ -> Alcotest.fail "Missing connection credit for discarded request");
         writer_yields t
       | _ -> assert false)
     | _ -> assert false

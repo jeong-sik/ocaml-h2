@@ -1,7 +1,7 @@
 (tests
  (libraries bigstringaf h2 alcotest test_common)
- (modules test_h2 test_h2_client test_h2_server test_priority)
- (names test_h2 test_h2_client test_h2_server test_priority))
+ (modules test_h2 test_h2_client test_h2_server test_priority test_body_lifecycle)
+ (names test_h2 test_h2_client test_h2_server test_priority test_body_lifecycle))
 
 (library
  (name test_common)

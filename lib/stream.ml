@@ -112,7 +112,7 @@ type ('state, 'error, 'error_handler) t =
   ; mutable state : 'state
         (* The largest frame payload we're allowed to write. *)
   ; mutable max_frame_size : int
-  ; on_close : active:bool -> closed -> unit
+  ; on_close : active:bool -> state:'state -> closed -> unit
   }
   constraint 'state = (_, _, _) state
 
@@ -135,10 +135,15 @@ let is_idle t = match t.state with Idle -> true | _ -> false
 let is_open t = match t.state with Active (Open _, _) -> true | _ -> false
 
 let finish_stream t reason =
-  let active = match t.state with Active _ -> true | _ -> false in
-  let closed = { reason; ttl = initial_ttl } in
-  t.on_close ~active closed;
-  t.state <- Closed closed
+  match t.state with
+  | Closed _ -> ()
+  | (Idle | Reserved _ | Active _) as state ->
+    let active = match state with Active _ -> true | _ -> false in
+    let closed = { reason; ttl = initial_ttl } in
+    (* Hooks can deliver application EOF callbacks. Publish the terminal state
+       first so a callback cannot respond on, or close again, a reset stream. *)
+    t.state <- Closed closed;
+    t.on_close ~active ~state closed
 
 let error_code t =
   match t.error_code with

@@ -109,11 +109,18 @@ let close_stream (t : t) =
 let _report_error (t : t) ?response_body (error : error) error_code =
   match t.error_code with
   | No_error ->
-    (match response_body with
-    | Some response_body -> Body.Reader.close response_body
-    | None -> ());
     t.error_code <- Stream.error_to_code error error_code;
-    t.error_handler error
+    (match response_body with
+    | Some response_body -> Body.Reader.abort response_body
+    | None -> ());
+    Fun.protect
+      ~finally:(fun () -> match response_body with
+        | Some body ->
+          (* Keep the original error and its reset even if EOF notification
+             raises after the response has already been aborted. *)
+          ignore (Body.Reader.execute_read_result body)
+        | None -> ())
+      (fun () -> t.error_handler error)
   | Exn _ | Other _ ->
     (* Already handling error.
      * TODO(anmonteiro): Log a message when we add Logs support *)
@@ -193,7 +200,7 @@ let flush_response_body (t : t) =
       ( ( Open (ActiveMessage { response_body; _ })
         | HalfClosed (ActiveMessage { response_body; _ }) )
       , _ ) ->
-    if Body.Reader.has_pending_output response_body
+    if Body.Reader.has_pending_output response_body || Body.Reader.is_closed response_body
     then (
       try Body.Reader.execute_read response_body with
       | exn -> report_error t (`Exn exn) InternalError)

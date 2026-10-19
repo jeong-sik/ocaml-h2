@@ -947,14 +947,14 @@ module Client_connection_tests = struct
   let test_nonzero_content_length_no_data_frames () =
     let t = create_and_handle_preface () in
     let request = Request.create ~scheme:"http" `GET "/" in
-    let handler_called = ref false in
+    let handler_called = ref false and rejected = ref false in
     let response_handler _response _response_body = handler_called := true in
     let request_body =
       Client_connection.request
         t
         request
         ~flush_headers_immediately:true
-        ~error_handler:default_error_handler
+        ~error_handler:(function `Invalid_response_body_length _ -> rejected := true | _ -> Alcotest.fail "Unexpected error")
         ~response_handler
     in
     flush_request t;
@@ -968,7 +968,8 @@ module Client_connection_tests = struct
       (Response.create
          ~headers:Headers.(of_list [ "content-length", "1234" ])
          `OK);
-    Alcotest.(check bool) "Response handler called" true !handler_called
+    Alcotest.(check bool) "Incomplete response not dispatched" false !handler_called;
+    Alcotest.(check bool) "Incomplete response rejected" true !rejected
 
   let test_unexpected_eof () =
     let t = create_and_handle_preface () in
@@ -1048,8 +1049,8 @@ module Client_connection_tests = struct
         `GET
         "/"
     in
-    let handler_called = ref false in
-    let response_handler _response _response_body = handler_called := true in
+    let handler_called = ref false and received_body = ref None in
+    let response_handler _response body = handler_called := true; received_body := Some body in
     let error_handler_called = ref false in
     let request_body =
       Client_connection.request
@@ -1082,9 +1083,22 @@ module Client_connection_tests = struct
     read_frames t [ rst_stream ];
     Alcotest.(check bool) "Response handler called" true !handler_called;
     Alcotest.(check bool) "error handler not called" false !error_handler_called;
+    let body = Option.get !received_body in
+    let bytes = Buffer.create 3 and eof = ref false in
+    let rec read () = Body.Reader.schedule_read body
+      ~on_eof:(fun () -> eof := true)
+      ~on_read:(fun data ~off ~len -> Buffer.add_string bytes (Bigstringaf.substring data ~off ~len); read ()) in
+    read ();
+    Alcotest.(check string) "Response survives upload cancellation" "foo" (Buffer.contents bytes);
+    Alcotest.(check bool) "Response EOF preserved" true !eof;
     (* Send the rest of the request body. *)
     Body.Writer.write_string request_body "hello";
     Body.Writer.close request_body;
+    let frames, lenv = flush_pending_writes t in
+    (match frames with
+     | [{ Frame.frame_header = { stream_id = 0l; _ }; frame_payload = WindowUpdate 3l }] -> ()
+     | _ -> Alcotest.fail "Reset must return only unread connection credits");
+    report_write_result t (`Ok lenv);
     writer_yielded t
 
   let test_connection_shutdown () =
